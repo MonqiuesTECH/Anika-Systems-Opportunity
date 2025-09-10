@@ -1,6 +1,4 @@
-import os
 import time
-import json
 import pathlib
 from typing import Optional
 
@@ -14,7 +12,7 @@ from src.retrieve import RagRetriever, AnswerWithCitations
 from src.prompts import build_prompt
 from src.metrics import TokenCounter, fmt_ms
 
-# ---------- App Config ----------
+# ---------------- App Config ----------------
 st.set_page_config(page_title="RAG Chatbot Assignment", page_icon="💬", layout="wide")
 load_dotenv()
 
@@ -25,16 +23,16 @@ INDEX_DIR = DATA_DIR / "index"
 for d in (RAW_DIR, PROC_DIR, INDEX_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-# ---------- Sidebar Controls ----------
+# ---------------- Sidebar ----------------
 st.sidebar.title("Settings")
 top_k = st.sidebar.slider("Top-K Documents", min_value=2, max_value=10, value=4, step=1)
 score_threshold = st.sidebar.slider("Score Threshold (lower = stricter)", 0.0, 1.0, 0.40, 0.05)
 section_filter = st.sidebar.text_input("Filter: section contains", value="")
-year_min = st.sidebar.number_input("Filter: year >= (optional)", min_value=0, value=0, step=1)
+year_min = st.sidebar.number_input("Filter: year ≥ (optional)", min_value=0, value=0, step=1)
 st.sidebar.markdown("---")
 st.sidebar.caption("Place 30–50 PDFs/HTML into `data/raw/` and reload the app.")
 
-# ---------- Bootstrap ----------
+# ---------------- Bootstrap ----------------
 @st.cache_resource(show_spinner=True)
 def bootstrap_index() -> Optional[IndexArtifacts]:
     docs = load_raw_documents(RAW_DIR)
@@ -70,7 +68,7 @@ with st.expander("ℹ️ Data & Index Details"):
         "fields": ["text", "source", "title", "section", "year", "url"]
     })
 
-# ---------- Chat UI ----------
+# ---------------- Chat UI ----------------
 if "chat" not in st.session_state:
     st.session_state.chat = []
 
@@ -93,7 +91,7 @@ if user_query:
             top_k=top_k,
             score_threshold=score_threshold,
             section_contains=section_filter.strip() or None,
-            year_min=int(year_min) if year_min else None
+            year_min=int(year_min) if year_min else None,
         )
 
         if not retrieved:
@@ -106,7 +104,7 @@ if user_query:
         else:
             system_prompt, final_context = build_prompt(user_query, retrieved)
 
-            # Local draft synthesis (no paid LLM call). Swap in your LLM here if desired.
+            # Local draft synthesis (no external LLM call).
             synthesized_answer = "**Answer (draft):**\n\nBased on the top sources:\n\n"
             for ctx in final_context:
                 synthesized_answer += f"- {ctx['summary']} {ctx['inline_citation']}\n"
@@ -115,7 +113,7 @@ if user_query:
             answer = AnswerWithCitations(
                 text=synthesized_answer,
                 citations=[c["inline_citation"] for c in final_context],
-                sources=final_context
+                sources=final_context,
             )
 
             st.markdown(answer.text)
@@ -130,4 +128,11 @@ if user_query:
                     )
 
             elapsed_ms = int((time.time() - t0) * 1000)
-            st.markdown("
+            st.markdown("---")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Latency", fmt_ms(elapsed_ms))
+            c2.metric("Prompt Tokens (est.)", token_counter.estimate_prompt_tokens(system_prompt))
+            c3.metric("Chunks Retrieved", len(answer.sources))
+
+            st.session_state.chat.append({"role": "assistant", "content": synthesized_answer})
+
