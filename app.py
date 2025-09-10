@@ -1,10 +1,67 @@
 import time
-import pathlib
-from typing import Optional
+from pathlib import Path
+from typing import Optional, List, Tuple
 
 import streamlit as st
 from dotenv import load_dotenv
 
+# ---- Try to import external fetcher; fall back to a built-in one ----
+try:
+    from scripts.fetch_corpus import fetch_starter_corpus as _external_fetch
+except Exception:
+    _external_fetch = None
+
+# ---- Local fallback fetcher (works on Streamlit Cloud) ----
+def _inline_fetch_starter_corpus(raw_root: Path = Path("data/raw")) -> int:
+    import requests  # local import to avoid hard dependency if unused
+
+    URLS: List[Tuple[str, str]] = [
+        # ---- Anika Systems (core pages)
+        ("https://www.anikasystems.com/",                           "anika/anika-home.html"),
+        ("https://www.anikasystems.com/whoweare.html",              "anika/who-we-are.html"),
+        ("https://www.anikasystems.com/capabilities.html",          "anika/capabilities.html"),
+        ("https://www.anikasystems.com/contracts.html",             "anika/contracts.html"),
+        ("https://www.anikasystems.com/insights.html",              "anika/insights.html"),
+        # ---- Federal AI / policy docs
+        ("https://www.whitehouse.gov/wp-content/uploads/2024/03/M-24-10-Advancing-Governance-Innovation-and-Risk-Management-for-Agency-Use-of-Artificial-Intelligence.pdf", "policy/OMB-M-24-10.pdf"),
+        ("https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-1.pdf",  "policy/NIST-AI-RMF-1.0.pdf"),
+        ("https://www.govinfo.gov/content/pkg/DCPD-202300949/pdf/DCPD-202300949.pdf", "policy/EO-14110.pdf"),
+        ("https://media.defense.gov/2024/Apr/15/2003439257/-1/-1/0/CSI-DEPLOYING-AI-SYSTEMS-SECURELY.PDF", "policy/CISA-Deploying-AI-Securely.pdf"),
+        ("https://www.dhs.gov/sites/default/files/2024-04/24_0426_dhs_ai-ci-safety-security-guidelines-508c.pdf", "policy/DHS-AI-Guidelines.pdf"),
+        # ---- GAO reports
+        ("https://www.gao.gov/assets/gao-24-107332.pdf",           "gao/GAO-24-107332.pdf"),
+        ("https://www.gao.gov/assets/gao-25-107653.pdf",           "gao/GAO-25-107653.pdf"),
+        # ---- GSA AI resources
+        ("https://coe.gsa.gov/coe/ai-guide-for-government/print-all/index.html", "gsa/GSA-AI-Guide.html"),
+        ("https://coe.gsa.gov/docs/2020/AIServiceCatalog.pdf",     "gsa/GSA-AI-Service-Catalog.pdf"),
+        # ---- Contract vehicles
+        ("https://www.nitaac.nih.gov/gwacs/cio-sp3",               "vehicles/CIO-SP3.html"),
+        ("https://itvmo.gsa.gov/it-vehicles/",                     "vehicles/GSA-IT-Vehicles.html"),
+    ]
+
+    raw_root.mkdir(parents=True, exist_ok=True)
+    saved = 0
+    for url, rel in URLS:
+        out_path = raw_root / rel
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            resp = requests.get(url, timeout=60)
+            resp.raise_for_status()
+            out_path.write_bytes(resp.content)
+            saved += 1
+        except Exception as e:
+            print(f"[fetch] skip {url}: {e}")
+    return saved
+
+def fetch_starter_corpus(raw_root: Path = Path("data/raw")) -> int:
+    if _external_fetch:
+        try:
+            return _external_fetch(raw_root)
+        except Exception as e:
+            print(f"[fetch] external fetcher failed, using inline fallback: {e}")
+    return _inline_fetch_starter_corpus(raw_root)
+
+# ---- Your RAG modules ----
 from src.loaders import load_raw_documents
 from src.clean_chunk import clean_and_chunk
 from src.embed_index import ensure_faiss_index, IndexArtifacts
@@ -16,7 +73,7 @@ from src.metrics import TokenCounter, fmt_ms
 st.set_page_config(page_title="RAG Chatbot Assignment", page_icon="💬", layout="wide")
 load_dotenv()
 
-DATA_DIR = pathlib.Path("data")
+DATA_DIR = Path("data")
 RAW_DIR = DATA_DIR / "raw"
 PROC_DIR = DATA_DIR / "processed"
 INDEX_DIR = DATA_DIR / "index"
@@ -30,11 +87,10 @@ score_threshold = st.sidebar.slider("Score Threshold (lower = stricter)", 0.0, 1
 section_filter = st.sidebar.text_input("Filter: section contains", value="")
 year_min = st.sidebar.number_input("Filter: year ≥ (optional)", min_value=0, value=0, step=1)
 st.sidebar.markdown("---")
-st.sidebar.caption("Place 30–50 PDFs/HTML into `data/raw/` or use the uploader below.")
+st.sidebar.caption("Place PDFs/HTML into `data/raw/`, use the uploader, or click the fetch button below.")
 
 # ---------------- Helpers ----------------
 def _rebuild_index() -> Optional[IndexArtifacts]:
-    """(Re)build the index if documents are present; return None if not."""
     docs = load_raw_documents(RAW_DIR)
     if not docs:
         return None
@@ -47,51 +103,59 @@ def _rebuild_index() -> Optional[IndexArtifacts]:
 def bootstrap_index() -> Optional[IndexArtifacts]:
     return _rebuild_index()
 
-# cache handle so we can clear it when uploading
 def _clear_bootstrap_cache():
     try:
         bootstrap_index.clear()  # type: ignore[attr-defined]
     except Exception:
         pass
 
-artifacts = bootstrap_index()
-
 # ---------------- Header ----------------
 st.title("RAG Chatbot – Source-Grounded Answers")
-st.caption("Local FAISS + Sentence Transformers + Streamlit. Inline citations, filters, and metrics included.")
+st.caption("Local FAISS • Sentence Transformers • Streamlit. Inline citations, filters, metrics, and upload/fetch tools included.")
 
-# ---------------- Inline uploader (works even with no index) ----------------
+# ---------------- Corpus tools ----------------
 st.markdown("#### Add or update documents")
-uploaded = st.file_uploader("Drop PDF/HTML files", type=["pdf", "html", "htm"], accept_multiple_files=True)
-col_upl, col_reb = st.columns([1, 1])
 
-if uploaded:
-    with col_upl:
-        if st.button("Save uploads"):
-            for f in uploaded:
-                dest = RAW_DIR / f.name
-                dest.write_bytes(f.getbuffer())
-            st.success(f"Saved {len(uploaded)} file(s) to `data/raw/`.")
-            _clear_bootstrap_cache()
-            artifacts = bootstrap_index()
-
-with col_reb:
-    if st.button("Rebuild index"):
+# One-click fetch (works on Streamlit Cloud & local)
+if st.button("🔽 Fetch starter corpus (Anika + federal AI)"):
+    with st.spinner("Downloading starter corpus..."):
+        n = fetch_starter_corpus(RAW_DIR)
+    if n > 0:
+        st.success(f"Fetched {n} files into `data/raw/`. Click **Rebuild index** next.")
         _clear_bootstrap_cache()
-        artifacts = bootstrap_index()
-        if artifacts:
-            st.success("Index rebuilt.")
+    else:
+        st.warning("No files were fetched. Try again, or use the uploader below.")
 
-# Always show index status (no st.stop)
+# Manual uploader (optional)
+uploaded = st.file_uploader("Drop PDF/HTML files", type=["pdf", "html", "htm"], accept_multiple_files=True)
+cols = st.columns([1, 1, 2])
+if uploaded and cols[0].button("Save uploads"):
+    saved = 0
+    for f in uploaded:
+        dest = RAW_DIR / f.name
+        dest.write_bytes(f.getbuffer())
+        saved += 1
+    st.success(f"Saved {saved} file(s) to `data/raw/`. Click **Rebuild index** to include them.")
+    _clear_bootstrap_cache()
+
+if cols[1].button("Rebuild index"):
+    with st.spinner("Building embeddings and FAISS index…"):
+        _clear_bootstrap_cache()
+        pass  # cache cleared; artifacts will be rebuilt on next access
+
+# Build/load index
+artifacts = bootstrap_index()
+
+# Show status
 if artifacts is None:
-    st.info("No index yet. Add at least one real PDF or HTML and click **Save uploads** or **Rebuild index**.")
+    st.info("No index yet. Add or fetch documents and click **Rebuild index**.")
 else:
     with st.expander("ℹ️ Data & Index Details", expanded=False):
         st.json({
             "num_chunks": len(artifacts.metadata),
             "embedding_model": artifacts.embedding_model_name,
             "index_path": str(INDEX_DIR.resolve()),
-            "fields": ["text", "source", "title", "section", "year", "url"]
+            "fields": ["text", "source", "title", "section", "year", "url"],
         })
 
 # ---------------- Retriever (if available) ----------------
@@ -105,8 +169,8 @@ for turn in st.session_state.chat:
     with st.chat_message(turn["role"]):
         st.markdown(turn["content"])
 
-prompt_placeholder = "Ask a question about your documents…" if retriever else "Upload documents and rebuild the index to enable Q&A…"
-user_query = st.chat_input(prompt_placeholder)
+placeholder = "Ask a question about your documents…" if retriever else "Fetch/upload docs and rebuild the index to enable Q&A…"
+user_query = st.chat_input(placeholder)
 
 if user_query:
     st.session_state.chat.append({"role": "user", "content": user_query})
@@ -116,7 +180,7 @@ if user_query:
     with st.chat_message("assistant"):
         if not retriever:
             msg = ("I’m ready once your index is built. "
-                   "Use the uploader above, then click **Rebuild index**.")
+                   "Use **Fetch starter corpus** or upload docs, then click **Rebuild index**.")
             st.markdown(msg)
             st.session_state.chat.append({"role": "assistant", "content": msg})
         else:
@@ -134,23 +198,23 @@ if user_query:
             if not retrieved:
                 msg = (
                     "I couldn’t find a confident answer in the indexed documents. "
-                    "Try rephrasing, lowering the score threshold, or removing filters."
+                    "Try rephrasing, lowering the score threshold, or clearing filters."
                 )
                 st.markdown(msg)
                 st.session_state.chat.append({"role": "assistant", "content": msg})
             else:
-                system_prompt, final_context = build_prompt(user_query, retrieved)
+                system_prompt, ctx = build_prompt(user_query, retrieved)
 
-                # Local draft synthesis (no external LLM call).
-                synthesized_answer = "**Answer (draft):**\n\nBased on the top sources:\n\n"
-                for ctx in final_context:
-                    synthesized_answer += f"- {ctx['summary']} {ctx['inline_citation']}\n"
-                synthesized_answer += "\n_This draft is synthesized from retrieved chunks shown below._"
+                # Cost-free synthesis (replace with an LLM call if desired)
+                answer_text = "**Answer (draft):**\n\nBased on the top sources:\n\n"
+                for c in ctx:
+                    answer_text += f"- {c['summary']} {c['inline_citation']}\n"
+                answer_text += "\n_This draft is synthesized from retrieved chunks shown below._"
 
                 answer = AnswerWithCitations(
-                    text=synthesized_answer,
-                    citations=[c["inline_citation"] for c in final_context],
-                    sources=final_context,
+                    text=answer_text,
+                    citations=[c["inline_citation"] for c in ctx],
+                    sources=ctx,
                 )
 
                 st.markdown(answer.text)
@@ -164,6 +228,7 @@ if user_query:
                             f"{src.get('url','')}"
                         )
 
+                # Metrics
                 elapsed_ms = int((time.time() - t0) * 1000)
                 st.markdown("---")
                 c1, c2, c3 = st.columns(3)
@@ -171,4 +236,4 @@ if user_query:
                 c2.metric("Prompt Tokens (est.)", token_counter.estimate_prompt_tokens(system_prompt))
                 c3.metric("Chunks Retrieved", len(answer.sources))
 
-                st.session_state.chat.append({"role": "assistant", "content": synthesized_answer})
+                st.session_state.chat.append({"role": "assistant", "content": answer_text})
