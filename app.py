@@ -5,15 +5,10 @@ from typing import Optional, List, Tuple
 import streamlit as st
 from dotenv import load_dotenv
 
-# ---- Try to import external fetcher; fall back to a built-in one ----
-try:
-    from scripts.fetch_corpus import fetch_starter_corpus as _external_fetch
-except Exception:
-    _external_fetch = None
-
-# ---- Local fallback fetcher (works on Streamlit Cloud) ----
+# -------------------- Inline starter-corpus fetcher --------------------
+# Works on Streamlit Cloud and locally; avoids shell scripts.
 def _inline_fetch_starter_corpus(raw_root: Path = Path("data/raw")) -> int:
-    import requests  # local import to avoid hard dependency if unused
+    import requests  # local import so it's optional unless used
 
     URLS: List[Tuple[str, str]] = [
         # ---- Anika Systems (core pages)
@@ -45,13 +40,19 @@ def _inline_fetch_starter_corpus(raw_root: Path = Path("data/raw")) -> int:
         out_path = raw_root / rel
         out_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            resp = requests.get(url, timeout=60)
-            resp.raise_for_status()
-            out_path.write_bytes(resp.content)
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            out_path.write_bytes(r.content)
             saved += 1
         except Exception as e:
             print(f"[fetch] skip {url}: {e}")
     return saved
+
+# If you also created scripts/fetch_corpus.py, we’ll try it first:
+try:
+    from scripts.fetch_corpus import fetch_starter_corpus as _external_fetch
+except Exception:
+    _external_fetch = None
 
 def fetch_starter_corpus(raw_root: Path = Path("data/raw")) -> int:
     if _external_fetch:
@@ -61,7 +62,7 @@ def fetch_starter_corpus(raw_root: Path = Path("data/raw")) -> int:
             print(f"[fetch] external fetcher failed, using inline fallback: {e}")
     return _inline_fetch_starter_corpus(raw_root)
 
-# ---- Your RAG modules ----
+# -------------------- RAG modules --------------------
 from src.loaders import load_raw_documents
 from src.clean_chunk import clean_and_chunk
 from src.embed_index import ensure_faiss_index, IndexArtifacts
@@ -69,7 +70,7 @@ from src.retrieve import RagRetriever, AnswerWithCitations
 from src.prompts import build_prompt
 from src.metrics import TokenCounter, fmt_ms
 
-# ---------------- App Config ----------------
+# -------------------- App config & paths --------------------
 st.set_page_config(page_title="RAG Chatbot Assignment", page_icon="💬", layout="wide")
 load_dotenv()
 
@@ -80,16 +81,16 @@ INDEX_DIR = DATA_DIR / "index"
 for d in (RAW_DIR, PROC_DIR, INDEX_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-# ---------------- Sidebar ----------------
+# -------------------- Sidebar --------------------
 st.sidebar.title("Settings")
-top_k = st.sidebar.slider("Top-K Documents", min_value=2, max_value=10, value=4, step=1)
+top_k = st.sidebar.slider("Top-K Documents", 2, 10, 4, 1)
 score_threshold = st.sidebar.slider("Score Threshold (lower = stricter)", 0.0, 1.0, 0.40, 0.05)
 section_filter = st.sidebar.text_input("Filter: section contains", value="")
 year_min = st.sidebar.number_input("Filter: year ≥ (optional)", min_value=0, value=0, step=1)
 st.sidebar.markdown("---")
 st.sidebar.caption("Place PDFs/HTML into `data/raw/`, use the uploader, or click the fetch button below.")
 
-# ---------------- Helpers ----------------
+# -------------------- Helpers --------------------
 def _rebuild_index() -> Optional[IndexArtifacts]:
     docs = load_raw_documents(RAW_DIR)
     if not docs:
@@ -109,46 +110,62 @@ def _clear_bootstrap_cache():
     except Exception:
         pass
 
-# ---------------- Header ----------------
+def _has_docs() -> bool:
+    return any(RAW_DIR.rglob("*.pdf")) or any(RAW_DIR.rglob("*.htm*"))
+
+# -------------------- Header --------------------
 st.title("RAG Chatbot – Source-Grounded Answers")
 st.caption("Local FAISS • Sentence Transformers • Streamlit. Inline citations, filters, metrics, and upload/fetch tools included.")
 
-# ---------------- Corpus tools ----------------
+# -------------------- Cold-start self-heal --------------------
+# If the server restarted and wiped runtime files, auto-populate so the app doesn't break.
+if not _has_docs():
+    with st.spinner("Cold start detected — fetching starter corpus…"):
+        n_auto = fetch_starter_corpus(RAW_DIR)
+    if n_auto > 0:
+        st.success(f"Fetched {n_auto} starter files. Building index…")
+        _clear_bootstrap_cache()
+        artifacts = bootstrap_index()
+    else:
+        artifacts = None
+        st.info("No documents fetched automatically. Use **Fetch starter corpus** or upload files, then click **Rebuild index**.")
+else:
+    artifacts = bootstrap_index()
+
+# -------------------- Corpus tools --------------------
 st.markdown("#### Add or update documents")
 
-# One-click fetch (works on Streamlit Cloud & local)
 if st.button("🔽 Fetch starter corpus (Anika + federal AI)"):
-    with st.spinner("Downloading starter corpus..."):
+    with st.spinner("Downloading starter corpus…"):
         n = fetch_starter_corpus(RAW_DIR)
     if n > 0:
-        st.success(f"Fetched {n} files into `data/raw/`. Click **Rebuild index** next.")
+        st.success(f"Fetched {n} files into `data/raw/`. Rebuilding index…")
         _clear_bootstrap_cache()
+        artifacts = bootstrap_index()
     else:
         st.warning("No files were fetched. Try again, or use the uploader below.")
 
-# Manual uploader (optional)
 uploaded = st.file_uploader("Drop PDF/HTML files", type=["pdf", "html", "htm"], accept_multiple_files=True)
-cols = st.columns([1, 1, 2])
-if uploaded and cols[0].button("Save uploads"):
+col_save, col_rebuild = st.columns([1, 1])
+if uploaded and col_save.button("Save uploads"):
     saved = 0
     for f in uploaded:
-        dest = RAW_DIR / f.name
-        dest.write_bytes(f.getbuffer())
+        (RAW_DIR / f.name).write_bytes(f.getbuffer())
         saved += 1
-    st.success(f"Saved {saved} file(s) to `data/raw/`. Click **Rebuild index** to include them.")
+    st.success(f"Saved {saved} file(s) to `data/raw/`. Rebuilding index…")
     _clear_bootstrap_cache()
+    artifacts = bootstrap_index()
 
-if cols[1].button("Rebuild index"):
+if col_rebuild.button("Rebuild index"):
     with st.spinner("Building embeddings and FAISS index…"):
         _clear_bootstrap_cache()
-        pass  # cache cleared; artifacts will be rebuilt on next access
+        artifacts = bootstrap_index()
+    if artifacts:
+        st.success("Index rebuilt.")
 
-# Build/load index
-artifacts = bootstrap_index()
-
-# Show status
+# -------------------- Index status --------------------
 if artifacts is None:
-    st.info("No index yet. Add or fetch documents and click **Rebuild index**.")
+    st.info("No index yet. Add/fetch documents and click **Rebuild index**.")
 else:
     with st.expander("ℹ️ Data & Index Details", expanded=False):
         st.json({
@@ -158,10 +175,10 @@ else:
             "fields": ["text", "source", "title", "section", "year", "url"],
         })
 
-# ---------------- Retriever (if available) ----------------
+# -------------------- Retriever --------------------
 retriever = RagRetriever(artifacts, top_k_default=top_k) if artifacts else None
 
-# ---------------- Chat UI (always rendered) ----------------
+# -------------------- Chat UI (always on) --------------------
 if "chat" not in st.session_state:
     st.session_state.chat = []
 
@@ -187,7 +204,7 @@ if user_query:
             t0 = time.time()
             token_counter = TokenCounter()
 
-            retrieved = retriever.search(
+            results = retriever.search(
                 query=user_query,
                 top_k=top_k,
                 score_threshold=score_threshold,
@@ -195,17 +212,15 @@ if user_query:
                 year_min=int(year_min) if year_min else None,
             )
 
-            if not retrieved:
-                msg = (
-                    "I couldn’t find a confident answer in the indexed documents. "
-                    "Try rephrasing, lowering the score threshold, or clearing filters."
-                )
+            if not results:
+                msg = ("I couldn’t find a confident answer in the indexed documents. "
+                       "Try rephrasing, lowering the score threshold to ~0.30, or clearing filters.")
                 st.markdown(msg)
                 st.session_state.chat.append({"role": "assistant", "content": msg})
             else:
-                system_prompt, ctx = build_prompt(user_query, retrieved)
+                system_prompt, ctx = build_prompt(user_query, results)
 
-                # Cost-free synthesis (replace with an LLM call if desired)
+                # Cost-free synthesis (swap for a real LLM if desired)
                 answer_text = "**Answer (draft):**\n\nBased on the top sources:\n\n"
                 for c in ctx:
                     answer_text += f"- {c['summary']} {c['inline_citation']}\n"
@@ -228,7 +243,6 @@ if user_query:
                             f"{src.get('url','')}"
                         )
 
-                # Metrics
                 elapsed_ms = int((time.time() - t0) * 1000)
                 st.markdown("---")
                 c1, c2, c3 = st.columns(3)
@@ -237,3 +251,4 @@ if user_query:
                 c3.metric("Chunks Retrieved", len(answer.sources))
 
                 st.session_state.chat.append({"role": "assistant", "content": answer_text})
+
