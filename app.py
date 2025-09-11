@@ -1,525 +1,493 @@
-import os
-import io
-import time
-import shutil
-import tempfile
-from pathlib import Path
+# app.py
+# Anika Systems • RAG Chatbot — Source-Grounded Answers
+# Streamlit 1.49+ / Python 3.13 compatible — no session_state writes inside cached funcs.
+
+from __future__ import annotations
+import os, io, json, re, time, hashlib, pathlib, textwrap
 from typing import List, Tuple, Dict, Any
-
 import streamlit as st
-import numpy as np
 
-# Lightweight, stable libs for RAG
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-import faiss
-from pypdf import PdfReader
+# Lightweight parsing
 from bs4 import BeautifulSoup
+from pypdf import PdfReader
 
-# -----------------------------
-# Paths & constants
-# -----------------------------
+# Embeddings / Vector store
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+
+########################################################################################
+# Paths / constants
+########################################################################################
 APP_NAME = "Anika Systems"
-RAW_DIR = Path("data/raw")
-INDEX_DIR = Path("data/index")
-CHUNK_DIR = Path("data/chunks")
+POWERED_BY = "Powered by Monique Bruce"
+RAW_DIR = pathlib.Path("data/raw")
+IDX_DIR = pathlib.Path("data/index")
+CHUNK_JSON = IDX_DIR / "chunks.json"
+FAISS_FILE = IDX_DIR / "faiss.index"
+EMB_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
 RAW_DIR.mkdir(parents=True, exist_ok=True)
-INDEX_DIR.mkdir(parents=True, exist_ok=True)
-CHUNK_DIR.mkdir(parents=True, exist_ok=True)
+IDX_DIR.mkdir(parents=True, exist_ok=True)
 
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"  # fast, accurate on CPU
-MAX_UPLOAD_MB = 200
-TARGET_MIN_DOCS = 30  # what the assignment wants
-MAX_TOP_K = 10
+SUPPORTED_EXT = {".pdf", ".html", ".htm"}
 
-# -----------------------------
-# Streamlit page config + theme
-# -----------------------------
-st.set_page_config(page_title=APP_NAME, page_icon="🤖", layout="wide")
+DEFAULT_TOPK = 4
+DEFAULT_THRESH = 0.40
 
-BLUE = "#2A66FF"
-DARK = "#0E1117"
-LIGHT = "#1B2130"
-TEXT = "#E6E9F2"
-ACCENT = "#1F6FEB"
+########################################################################################
+# Styling (black + blue)
+########################################################################################
+st.set_page_config(
+    page_title=f"{APP_NAME} — RAG Chatbot",
+    page_icon="🤖",
+    layout="wide"
+)
 
-CUSTOM_CSS = f"""
+PRIMARY = "#65A9FF"      # blue
+BG_DARK = "#0f172a"      # slate-900
+PANEL = "#111827"        # gray-900
+TEXT = "#E5E7EB"         # gray-200
+MUTED = "#94A3B8"        # slate-400
+ACCENT = "#1e40af"       # blue-800
+
+st.markdown(f"""
 <style>
-    .stApp {{
-        background-color: {DARK};
-        color: {TEXT};
-    }}
-    .block-container {{
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
-    }}
-    .anika-title {{
-        font-size: 42px;
-        font-weight: 900;
-        color: white;
-        text-shadow: 0 0 16px rgba(42,102,255,0.35);
-        margin-bottom: 0.1rem;
-    }}
-    .section-card {{
-        background: {LIGHT};
-        border: 1px solid rgba(255,255,255,0.06);
-        border-radius: 12px;
-        padding: 18px 18px 12px 18px;
-    }}
-    .button-primary button {{
-        background: linear-gradient(90deg, {BLUE}, {ACCENT});
-        color: white !important;
-        border: 0;
-    }}
-    .small-note {{
-        font-size: 12px;
-        opacity: 0.85;
-    }}
-    .footer {{
-        color: #B8C1D1;
-        text-align: center;
-        margin-top: 10px;
-        font-size: 12px;
-        opacity: 0.8;
-    }}
-    .cite {{
-        font-size: 12px;
-        opacity: 0.85;
-    }}
-    .chat-bubble-q {{
-        background: #1a2233;
-        border: 1px solid rgba(255,255,255,0.06);
-        padding: 10px 12px;
-        border-radius: 10px;
-        color: {TEXT};
-        font-weight: 600;
-    }}
-    .chat-bubble-a {{
-        background: #101826;
-        border: 1px solid rgba(255,255,255,0.06);
-        padding: 12px 14px;
-        border-radius: 10px;
-        color: {TEXT};
-    }}
+/* base */
+.stApp {{ background: radial-gradient(50% 50% at 50% 0%, #0b1222 0%, {BG_DARK} 60%); color:{TEXT}; }}
+h1, h2, h3, h4, h5, h6 {{ color: {TEXT}; }}
+.block-container {{ padding-top: 1.2rem; padding-bottom: 2rem; }}
+/* cards */
+.card {{
+  background:{PANEL};
+  border:1px solid #1f2937;
+  border-radius:12px; padding:14px 16px; box-shadow:0 0 0 1px rgba(255,255,255,0.02) inset;
+}}
+small, .muted {{ color:{MUTED}; }}
+/* buttons */
+.stButton>button {{
+  background:{ACCENT}; border-radius:8px; border:0; color:white; font-weight:600;
+}}
+/* inputs */
+[data-baseweb="input"] input {{ color:{TEXT}; }}
+/* sliders text */
+.css-184tjsw, .css-17z6c7b, .css-q8sbsg {{ color:{TEXT} !important; }}
+/* footer */
+.footer {{ margin-top:10px; text-align:center; color:{MUTED}; font-size:12px; }}
 </style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-# -----------------------------
-# Session state helpers (safe)
-# -----------------------------
-def sget(key: str, default: Any) -> Any:
-    if key not in st.session_state:
-        st.session_state[key] = default
-    return st.session_state[key]
+########################################################################################
+# Session state (init only here; never mutate inside cached/resource funcs)
+########################################################################################
+def init_state():
+    ss = st.session_state
+    defaults = dict(
+        top_k=DEFAULT_TOPK,
+        threshold=DEFAULT_THRESH,
+        filter_contains="",
+        filter_year_min=0,
+        index_ready=False,
+        index_stats="",
+        # runtime
+        last_build_started=None,
+        last_build_finished=None,
+        model_loaded=False,
+    )
+    for k, v in defaults.items():
+        if k not in ss:
+            ss[k] = v
 
-def supdate(mapping: Dict[str, Any]) -> None:
-    # Single place to update session state inside callbacks
-    for k, v in mapping.items():
-        st.session_state[k] = v
+init_state()
 
-# Initialize expected keys
-sget("index_ready", False)
-sget("doc_count", 0)
-sget("status", "")
-sget("query", "")
-sget("top_k", 4)
-sget("score_thresh", 0.40)
-sget("section_filter", "")
-sget("min_year", 0)
-sget("history", [])
-
-# -----------------------------
-# Utility: read PDF & HTML
-# -----------------------------
-def read_pdf_bytes(data: bytes) -> str:
-    try:
-        pdf = PdfReader(io.BytesIO(data))
-        parts = []
-        for page in pdf.pages:
-            txt = page.extract_text() or ""
-            if txt.strip():
-                parts.append(txt)
-        return "\n".join(parts)
-    except Exception:
-        return ""
-
-def read_html_bytes(data: bytes) -> str:
-    try:
-        soup = BeautifulSoup(data, "lxml")
-        # Strip scripts/styles and get visible text
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-        text = soup.get_text(separator="\n")
-        return "\n".join([line.strip() for line in text.splitlines() if line.strip()])
-    except Exception:
-        return ""
-
-# -----------------------------
-# Chunking & Cleaning
-# -----------------------------
+########################################################################################
+# Utilities
+########################################################################################
 def clean_text(t: str) -> str:
-    t = t.replace("\x00", " ").replace("\u200b", " ")
-    return "\n".join(line.strip() for line in t.splitlines() if line.strip())
+    t = re.sub(r"\s+", " ", t or "").strip()
+    return t
 
-def chunk_text(t: str, max_chars: int = 1200, overlap: int = 120) -> List[str]:
-    t = clean_text(t)
-    if not t:
+def file_sha1(path: pathlib.Path) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def chunk_text(t: str, max_tokens: int = 220, overlap: int = 40) -> List[str]:
+    """Simple token-ish chunking by words (MiniLM tolerates this well)."""
+    words = t.split()
+    if not words:
         return []
-    chunks = []
-    start = 0
-    while start < len(t):
-        end = min(start + max_chars, len(t))
-        chunk = t[start:end]
-        if len(chunk) < 200 and chunks:  # avoid tiny tail fragments
-            chunks[-1] += " " + chunk
-            break
-        chunks.append(chunk)
-        start = end - overlap
-        if start < 0:
-            start = 0
+    chunks, start = [], 0
+    step = max_tokens - overlap
+    while start < len(words):
+        end = min(len(words), start + max_tokens)
+        chunks.append(" ".join(words[start:end]))
+        start += step
     return chunks
 
-# -----------------------------
-# Embeddings + FAISS
-# -----------------------------
-@st.cache_resource(show_spinner=False)
-def get_model() -> SentenceTransformer:
-    return SentenceTransformer(EMBED_MODEL_NAME)
-
-def embed_chunks(model: SentenceTransformer, chunks: List[str]) -> np.ndarray:
-    # batched for memory friendliness
-    vecs = model.encode(chunks, batch_size=64, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True)
-    return vecs.astype("float32")
-
-def build_faiss_index(vecs: np.ndarray) -> faiss.IndexFlatIP:
-    idx = faiss.IndexFlatIP(vecs.shape[1])
-    idx.add(vecs)
-    return idx
-
-# -----------------------------
-# Corpus building
-# -----------------------------
-def save_uploaded_files(files: List[st.runtime.uploaded_file_manager.UploadedFile]) -> int:
-    count = 0
-    for uf in files:
-        if uf is None:
-            continue
-        name = uf.name
-        if not (name.lower().endswith(".pdf") or name.lower().endswith(".html") or name.lower().endswith(".htm")):
-            continue
-        out = RAW_DIR / name
-        with open(out, "wb") as f:
-            f.write(uf.getbuffer())
-        count += 1
-    return count
-
-def try_fetch_starter_docs() -> Tuple[int, str]:
-    """
-    Attempt to fetch a public mini-corpus (30+ PDFs/HTML) when outbound network works.
-    If blocked, return (0, reason).
-    """
-    import requests
-
-    # A small, compliance-friendly starter set of public PDFs/HTMLs.
-    # You can replace these with role-specific URLs if needed.
-    sources = [
-        # (url, filename)
-        ("https://www.whitehouse.gov/wp-content/uploads/2023/03/M-23-16.pdf", "OMB-M-23-16.pdf"),
-        ("https://www.whitehouse.gov/wp-content/uploads/2022/07/M-22-18.pdf", "OMB-M-22-18.pdf"),
-        ("https://assets.publishing.service.gov.uk/media/65f31e9a82e142000d8e3b3c/AI_Safety_Summit_-_Bletchley_Declaration.pdf", "Bletchley_Declaration.pdf"),
-        ("https://www.nist.gov/system/files/documents/2023/01/26/AI_RMF_1.0.pdf", "NIST-AI-RMF-1.0.pdf"),
-        ("https://www.nist.gov/system/files/documents/2023/01/26/AI_RMF_1.0_Playbook.pdf", "NIST-AI-RMF-Playbook.pdf"),
-        ("https://www.ftc.gov/system/files/ftc_gov/pdf/p231000AIguidance.pdf", "FTC-AI-Guidance.pdf"),
-        ("https://www.justice.gov/archives/ag/attachment/file/1401076/download", "DOJ-Civil-Cyber-Fraud.pdf"),
-        ("https://www.energy.gov/sites/default/files/2023-02/DOE-AI-Strategy.pdf", "DOE-AI-Strategy.pdf"),
-        ("https://www.congress.gov/118/bills/s3050/BILLS-118s3050is.pdf", "AI-Legislation-S3050.pdf"),
-        ("https://www.dhs.gov/sites/default/files/2024-03/24_0319_plcy_ai-task-force-2024-report-1.pdf", "DHS-AI-Task-Force-2024.pdf"),
-        ("https://www.cisa.gov/sites/default/files/2023-10/cisa-secure-by-design.pdf", "CISA-Secure-by-Design.pdf"),
-        ("https://assets.publishing.service.gov.uk/media/6542f8f0bf2fbf000d8a8c2b/UK-AI-Safety-Policy.pdf", "UK-AI-Safety-Policy.pdf"),
-        ("https://www.whitehouse.gov/wp-content/uploads/2023/10/Executive-Order-Safe-Secure-and-Trustworthy-AI.pdf", "US-EO-AI-2023.pdf"),
-        ("https://www.whitehouse.gov/wp-content/uploads/2023/10/Blueprint-for-an-AI-Bill-of-Rights.pdf", "AI-Bill-of-Rights.pdf"),
-        ("https://www.whitehouse.gov/wp-content/uploads/2024/03/OMB-M-24-10.pdf", "OMB-M-24-10.pdf"),
-        ("https://ai.gov/wp-content/uploads/2024/03/US-AI-Use-Cases.pdf", "US-AI-Use-Cases.pdf"),
-        # add more quick HTML sources
-        ("https://www.anikasystems.com/", "anika-home.html"),
-        ("https://www.anikasystems.com/capabilities/", "anika-capabilities.html"),
-        ("https://www.anikasystems.com/careers/", "anika-careers.html"),
-        ("https://www.anikasystems.com/insights/", "anika-insights.html"),
-    ]
-
-    # Duplicate list to exceed 30 when networking allows.
-    while len(sources) < 32:
-        sources += sources[: max(0, 32 - len(sources))]
-
-    ok = 0
+def read_html(path: pathlib.Path) -> str:
     try:
-        for url, fname in sources:
-            dest = RAW_DIR / fname
-            if dest.exists() and dest.stat().st_size > 0:
-                ok += 1
-                continue
-            r = requests.get(url, timeout=15)
-            if r.status_code == 200 and r.content:
-                with open(dest, "wb") as f:
-                    f.write(r.content)
-                ok += 1
-            # be polite to the host
-            time.sleep(0.2)
-        return ok, "" if ok >= TARGET_MIN_DOCS else "Fetched fewer than target"
+        with open(path, "rb") as f:
+            soup = BeautifulSoup(f.read(), "lxml")
+        # common noise removal
+        for s in soup(["script", "style", "noscript", "header", "footer", "nav", "form"]):
+            s.extract()
+        txt = clean_text(soup.get_text(" "))
+        return txt
     except Exception as e:
-        return ok, f"Network blocked or sources unavailable: {e}"
+        return ""
 
-def load_corpus_to_chunks() -> Tuple[List[str], List[Tuple[str, int]]]:
-    """
-    Returns:
-      chunks: list of text chunks
-      meta:   list of (filename, chunk_index) aligned with chunks
-    """
-    chunks, meta = [], []
-    files = list(RAW_DIR.glob("*.pdf")) + list(RAW_DIR.glob("*.html")) + list(RAW_DIR.glob("*.htm"))
-    for fp in files:
-        try:
-            data = fp.read_bytes()
-            txt = read_pdf_bytes(data) if fp.suffix.lower() == ".pdf" else read_html_bytes(data)
-            parts = chunk_text(txt)
-            for i, p in enumerate(parts):
-                chunks.append(p)
-                meta.append((fp.name, i))
-        except Exception:
-            continue
-    return chunks, meta
-
-def write_chunks_disk(chunks: List[str], meta: List[Tuple[str, int]]) -> None:
-    # Optional: store chunk files for inspection/debug
-    with open(CHUNK_DIR / "chunks.txt", "w", encoding="utf-8") as f:
-        for (fn, i), ch in zip(meta, chunks):
-            f.write(f"## {fn}::{i}\n{ch}\n\n")
-
-# -----------------------------
-# Index manager
-# -----------------------------
-def rebuild_index_callback():
-    supdate({"status": "Building index...", "index_ready": False})
-    with st.spinner("Indexing…"):
-        chunks, meta = load_corpus_to_chunks()
-        doc_count = len({m[0] for m in meta})
-        supdate({"doc_count": doc_count})
-        if not chunks:
-            supdate({"status": "No indexable content found. Upload PDFs/HTML or fetch corpus.", "index_ready": False})
-            return
-
-        model = get_model()
-        vecs = embed_chunks(model, chunks)
-        idx = build_faiss_index(vecs)
-
-        # persist
-        faiss.write_index(idx, str(INDEX_DIR / "faiss.index"))
-        np.save(INDEX_DIR / "embeddings.shape.npy", np.array(vecs.shape))
-        with open(INDEX_DIR / "meta.tsv", "w", encoding="utf-8") as f:
-            for (fn, i) in meta:
-                f.write(f"{fn}\t{i}\n")
-        write_chunks_disk(chunks, meta)
-
-        supdate({"status": f"Index built: {len(chunks)} chunks from {doc_count} files.", "index_ready": True})
-
-def fetch_starter_callback():
-    supdate({"status": "Fetching starter corpus...", "index_ready": False})
-    with st.spinner("Fetching 30+ public docs…"):
-        n, reason = try_fetch_starter_docs()
-    if n >= TARGET_MIN_DOCS:
-        supdate({"status": f"Fetched {n} file(s) into data/raw/. Click Rebuild index.", "doc_count": n})
-    else:
-        msg = f"Could only fetch {n} file(s). {reason or ''} You can upload or git-push PDFs/HTML to data/raw/."
-        supdate({"status": msg.strip(), "doc_count": n})
-
-def clear_index_callback():
+def read_pdf(path: pathlib.Path) -> str:
     try:
-        if INDEX_DIR.exists():
-            shutil.rmtree(INDEX_DIR)
-        INDEX_DIR.mkdir(parents=True, exist_ok=True)
-        supdate({"index_ready": False, "status": "Cleared index. Rebuild when ready."})
+        reader = PdfReader(str(path))
+        pages = [clean_text(page.extract_text() or "") for page in reader.pages]
+        return " ".join(p for p in pages if p)
+    except Exception:
+        return ""
+
+def load_file_text(path: pathlib.Path) -> str:
+    ext = path.suffix.lower()
+    if ext == ".pdf":
+        return read_pdf(path)
+    elif ext in {".html", ".htm"}:
+        return read_html(path)
+    return ""
+
+########################################################################################
+# Model & Index (never write to session_state inside these)
+########################################################################################
+@st.cache_resource(show_spinner=False)
+def load_model(model_name: str = EMB_MODEL_NAME):
+    model = SentenceTransformer(model_name)
+    dim = model.get_sentence_embedding_dimension()
+    return model, dim
+
+@st.cache_resource(show_spinner=False)
+def new_index(dim: int):
+    # Flat L2 index; cosine via normalized vectors
+    return faiss.IndexFlatIP(dim)
+
+def embed_texts(model: SentenceTransformer, texts: List[str]) -> np.ndarray:
+    # normalize for cosine similarity (then use inner product)
+    embs = model.encode(texts, normalize_embeddings=True, batch_size=64, show_progress_bar=False)
+    return np.asarray(embs, dtype="float32")
+
+def scan_raw_files(min_year: int = 0, contains: str = "") -> List[pathlib.Path]:
+    files = []
+    for p in RAW_DIR.glob("*"):
+        if p.is_file() and p.suffix.lower() in SUPPORTED_EXT:
+            if min_year:
+                try:
+                    # guess year from name
+                    yrs = re.findall(r"(20\d{2}|19\d{2})", p.name)
+                    if yrs and int(yrs[0]) < min_year:
+                        continue
+                except Exception:
+                    pass
+            if contains:
+                if contains.lower() not in p.name.lower():
+                    continue
+            files.append(p)
+    return sorted(files, key=lambda q: q.name.lower())
+
+def build_index_ui(files: List[pathlib.Path]) -> Tuple[faiss.Index, List[Dict[str, Any]], int]:
+    """
+    Parse -> chunk -> embed -> FAISS
+    Returns (index, chunks_meta, n_chunks)
+    """
+    model, dim = load_model()
+    index = new_index(dim)
+
+    all_chunks: List[str] = []
+    meta: List[Dict[str, Any]] = []
+
+    for fp in files:
+        txt = load_file_text(fp)
+        if not txt:
+            continue
+        # gentle guard against html nav spam
+        txt = re.sub(r"(?:\b(Privacy|Cookies|Accept|Subscribe|Share)\b.{0,30}){2,}", " ", txt, flags=re.I)
+        chunks = chunk_text(txt, max_tokens=220, overlap=50)
+        for i, c in enumerate(chunks):
+            all_chunks.append(c)
+            meta.append({
+                "file": fp.name,
+                "path": str(fp),
+                "chunk_id": f"{fp.name}:::{i}",
+            })
+
+    if not all_chunks:
+        return index, [], 0
+
+    embs = embed_texts(model, all_chunks)
+    index.add(embs)  # shape (N, dim)
+
+    # persist to disk (best effort; not relied on for cache)
+    try:
+        faiss.write_index(index, str(FAISS_FILE))
+        with open(CHUNK_JSON, "w") as f:
+            json.dump({"meta": meta}, f)
     except Exception:
         pass
 
-# -----------------------------
-# Search + Answer
-# -----------------------------
-def load_index() -> Tuple[faiss.IndexFlatIP, List[Tuple[str, int]], Tuple[int, int]]:
-    idx_path = INDEX_DIR / "faiss.index"
-    shape_path = INDEX_DIR / "embeddings.shape.npy"
-    meta_path = INDEX_DIR / "meta.tsv"
-    if not (idx_path.exists() and meta_path.exists() and shape_path.exists()):
-        return None, [], (0, 0)  # type: ignore
-    idx = faiss.read_index(str(idx_path))
-    shape = tuple(np.load(shape_path))
-    meta: List[Tuple[str, int]] = []
-    with open(meta_path, "r", encoding="utf-8") as f:
-        for line in f:
-            fn, i = line.rstrip("\n").split("\t")
-            meta.append((fn, int(i)))
-    return idx, meta, shape  # type: ignore
+    return index, meta, len(all_chunks)
 
-def search(query: str, top_k: int, score_thresh: float, section_filter: str, min_year: int) -> List[Tuple[float, str, str]]:
-    idx, meta, shape = load_index()
-    if idx is None:
-        return []
-
-    # Recreate the same embedder used to build the index
-    model = get_model()
-    qv = embed_chunks(model, [query])[0:1]  # (1, d)
-    scores, indices = idx.search(qv, min(top_k * 4, MAX_TOP_K * 4))  # oversample, then post-filter
-    scores = scores[0]
-    indices = indices[0]
-
-    # Build chunk lookup in-memory (lazy read from CHUNK_DIR file)
-    chunk_lines = (CHUNK_DIR / "chunks.txt").read_text(encoding="utf-8").splitlines()
-
-    results: List[Tuple[float, str, str]] = []
-    for s, ix in zip(scores, indices):
-        if ix < 0:
-            continue
-        # Locate the chunk by scanning the marker header in chunks.txt
-        # (format: "## filename::i")
-        # For speed, derive filename + chunk index from meta list
-        fn, ci = meta[ix]
-        # Optional filters
-        if section_filter and section_filter.lower() not in fn.lower():
-            # try in the first 200 chars of the chunk
-            pass
-
-        # Attempt to read the exact chunk:
-        # A crude but effective lookup by generating the header and scanning forward.
-        header = f"## {fn}::{ci}"
+@st.cache_resource(show_spinner=False)
+def load_persisted_index() -> Tuple[faiss.Index|None, List[Dict[str, Any]]]:
+    if FAISS_FILE.exists() and CHUNK_JSON.exists():
         try:
-            start = chunk_lines.index(header)
-            # chunk starts at next line, ends at next header or EOF
-            j = start + 1
-            body_lines = []
-            while j < len(chunk_lines) and not chunk_lines[j].startswith("## "):
-                body_lines.append(chunk_lines[j])
-                j += 1
-            body = "\n".join(body_lines).strip()
-        except ValueError:
-            body = ""
+            index = faiss.read_index(str(FAISS_FILE))
+            meta = json.load(open(CHUNK_JSON))["meta"]
+            return index, meta
+        except Exception:
+            return None, []
+    return None, []
 
-        # Year filter: quick heuristic (look for a 4-digit year in filename/body)
-        if min_year > 0:
-            year_hits = []
-            for cand in [fn] + body.split():
-                if len(cand) == 4 and cand.isdigit():
-                    y = int(cand)
-                    if 1900 <= y <= 2100:
-                        year_hits.append(y)
-            if year_hits and max(year_hits) < min_year:
-                continue
+def ensure_index(min_year: int, contains: str) -> Tuple[faiss.Index|None, List[Dict[str, Any]], str]:
+    """Decides whether to rebuild or reuse; returns (index, meta, stats_str)."""
+    files = scan_raw_files(min_year=min_year, contains=contains)
+    stats = f"{len(files)} files detected in data/raw/"
+    if not files:
+        return None, [], stats + " — add PDFs/HTML then click Rebuild index."
 
-        if s >= score_thresh and body:
-            results.append((float(s), fn, body))
+    # Always (re)build live to reflect filters; no session_state writes here.
+    idx, meta, n = build_index_ui(files)
+    stats = f"Index built: {n} chunks from {len(set([m['file'] for m in meta]))} files."
+    return idx if n else None, meta, stats
 
-        if len(results) >= top_k:
-            break
+def search(index: faiss.Index, meta: List[Dict[str, Any]], query: str, k: int) -> List[Tuple[float, Dict[str, Any]]]:
+    model, _ = load_model()
+    q = embed_texts(model, [query])
+    sims, idxs = index.search(q, k)  # inner product on normalized embeddings -> cosine
+    hits: List[Tuple[float, Dict[str, Any]]] = []
+    for score, i in zip(sims[0], idxs[0]):
+        if i == -1: 
+            continue
+        m = meta[int(i)]
+        hits.append((float(score), m))
+    return hits
 
-    return results
+########################################################################################
+# Small, grounded answerer (concise; 2–4 sentences; no hallucinations)
+########################################################################################
+def generate_answer(query: str, hits: List[Tuple[float, Dict[str, Any]]], chunks: List[str], thresh: float) -> Tuple[str, List[Tuple[float,str]]]:
+    kept = []
+    for score, m in hits:
+        if score >= thresh:
+            kept.append((score, m))
+    if not kept:
+        return ("I couldn’t find a high-confidence answer in the uploaded sources. "
+                "Try lowering the score threshold or adding more documents." , [])
 
-def answer_from_chunks(q: str, hits: List[Tuple[float, str, str]]) -> str:
-    if not hits:
-        return "I couldn’t find a grounded answer in the indexed documents. Please refine your question or lower the score threshold."
+    # pull text for kept chunks
+    evidences = []
+    for score, m in kept:
+        # m['chunk_id'] ends with :::i
+        try:
+            i = int(m["chunk_id"].split(":::")[-1])
+        except Exception:
+            i = 0
+        evidences.append((score, m["file"], chunks[i]))
 
-    # Ultra-concise, extractive style: 1–3 sentences max, with bullet list when appropriate.
-    # We do a tiny template that selects the most relevant snippets.
-    snippets = []
-    for _, fn, body in hits:
-        snippet = body[:400].replace("\n", " ").strip()
-        snippets.append((fn, snippet))
+    # Compose short answer by extractive synthesis
+    # Take top 2–3 spans that contain the main keywords
+    spans = []
+    q_terms = [w.lower() for w in re.findall(r"[a-zA-Z0-9]+", query) if len(w) > 2]
+    for sc, fname, txt in evidences[:6]:
+        # pick a 1–2 sentence window around most overlap
+        sents = re.split(r"(?<=[.!?])\s+", txt)
+        best = sorted(sents, key=lambda s: -sum(t in s.lower() for t in q_terms))[:2]
+        spans.extend(best)
 
-    # Compose a short answer
-    # Heuristic: take the first snippet for direct answer; append 1–2 bullets as citations.
-    main = snippets[0][1]
-    # Truncate to ~300 chars
-    if len(main) > 300:
-        main = main[:297] + "…"
+    summary = " ".join(spans[:3])
+    summary = clean_text(summary)
+    if len(summary) < 40:
+        # fall back to first evidence chunk trimmed
+        summary = clean_text(evidences[0][2])[:400]
 
-    lines = [main]
-    lines.append("\n**Sources**:")
-    for fn, snip in snippets[: min(3, len(snippets))]:
-        lines.append(f"- {fn}")
-    return "\n".join(lines)
+    # Trim to ~3 sentences
+    summary_sents = re.split(r"(?<=[.!?])\s+", summary)[:3]
+    answer = " ".join(summary_sents)
+    # Citations (top 3)
+    cits = [(sc, fn) for sc, fn, _ in evidences[:3]]
+    return answer, cits
 
-# -----------------------------
+########################################################################################
 # UI
-# -----------------------------
-left, right = st.columns([1, 2.2])
-with left:
-    st.markdown(f"<div class='anika-title'>{APP_NAME}</div>", unsafe_allow_html=True)
-    st.caption("RAG Chatbot – Source-Grounded Answers")
+########################################################################################
+st.markdown(f"<h1 style='margin:0 0 8px 0;'>{APP_NAME}</h1>", unsafe_allow_html=True)
+st.markdown("<div class='muted'>RAG Chatbot — Source-Grounded Answers</div>", unsafe_allow_html=True)
+st.write("")
 
-    st.markdown("**Settings**")
-    st.session_state.top_k = st.slider("Top-K Documents", 1, MAX_TOP_K, sget("top_k", 4))
-    st.session_state.score_thresh = st.slider("Score Threshold (lower = stricter)", 0.0, 0.99, sget("score_thresh", 0.40))
-    st.session_state.section_filter = st.text_input("Filter: section contains", sget("section_filter", ""))
-    st.session_state.min_year = st.number_input("Filter: year ≥ (optional)", min_value=0, max_value=2100, value=sget("min_year", 0), step=1)
-
+with st.sidebar:
+    st.subheader("Settings")
+    st.session_state.top_k = st.slider("Top-K Documents", 1, 10, st.session_state.top_k)
+    st.session_state.threshold = st.slider("Score Threshold (lower = stricter)", 0.10, 0.95, st.session_state.threshold, 0.01)
+    st.session_state.filter_contains = st.text_input("Filter: section contains", st.session_state.filter_contains)
+    st.session_state.filter_year_min = st.number_input("Filter: year ≥ (optional)", min_value=0, max_value=2100, step=1, value=st.session_state.filter_year_min)
     st.markdown(
-        "<div class='section-card small-note'>Tip: place **30–50 PDFs/HTML** into <code>data/raw/</code> (git push), "
-        "or use the uploader on the right. Click **Rebuild index** afterwards.</div>",
-        unsafe_allow_html=True,
+        "<div class='card'><small>Tip: place <b>30–50 PDFs/HTML</b> into <code>data/raw/</code> (git push), or use the uploader below. Then click <b>Rebuild index</b>.</small></div>",
+        unsafe_allow_html=True
     )
 
-with right:
-    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    st.subheader("Add or update documents")
+st.markdown("### Add or update documents")
+col_u, col_rebuild, col_fetch = st.columns([6,2,3])
 
-    c1, c2, c3 = st.columns([1.5, 1, 1])
-    with c1:
-        uploads = st.file_uploader(
-            "Drop PDF/HTML files (≤200MB each)", type=["pdf", "html", "htm"], accept_multiple_files=True
+with col_u:
+    uploaded = st.file_uploader("Drop PDF/HTML files", type=["pdf","html","htm"], accept_multiple_files=True, label_visibility="collapsed")
+    if uploaded:
+        saved = 0
+        for uf in uploaded:
+            ext = os.path.splitext(uf.name)[1].lower()
+            if ext not in SUPPORTED_EXT: 
+                continue
+            target = RAW_DIR / uf.name
+            with open(target, "wb") as f:
+                f.write(uf.getbuffer())
+            saved += 1
+        st.success(f"Saved {saved} file(s) into data/raw/.")
+
+with col_rebuild:
+    do_rebuild = st.button("Rebuild index", use_container_width=True)
+
+with col_fetch:
+    # Best effort starter corpus — if network blocks, we just explain the failure.
+    def fetch_starter_files() -> Tuple[int,int,List[str]]:
+        import requests
+        # Curated, crawl-friendly public pages (HTML) only.
+        urls = [
+            "https://www.anikasystems.com/", 
+            "https://www.anikasystems.com/who-we-are",
+            "https://www.anikasystems.com/capabilities",
+            "https://www.anikasystems.com/careers",
+            "https://www.anikasystems.com/insights",
+            "https://www.anikasystems.com/contact",
+            "https://ai.gov/strategic-plan/",  # federal AI (public)
+            "https://www.whitehouse.gov/ostp/ai-bill-of-rights/",
+            "https://www.whitehouse.gov/wp-content/uploads/2023/10/Executive-Order-Safe-Secure-and-Trustworthy-Development-and-Use-of-AI.pdf",
+        ]
+        ok, fail, failed = 0, 0, []
+        for u in urls:
+            try:
+                r = requests.get(u, timeout=12)
+                r.raise_for_status()
+                name = re.sub(r"[^a-z0-9]+", "_", u.lower()).strip("_")[:70]
+                if u.lower().endswith(".pdf"):
+                    path = RAW_DIR / f"{name}.pdf"
+                    open(path, "wb").write(r.content)
+                else:
+                    path = RAW_DIR / f"{name}.html"
+                    open(path, "wb").write(r.content)
+                ok += 1
+            except Exception:
+                fail += 1
+                failed.append(u)
+        return ok, fail, failed
+
+    if st.button("Fetch starter corpus (Anika + federal AI)", use_container_width=True):
+        with st.spinner("Fetching starter files…"):
+            try:
+                ok, fail, failed = fetch_starter_files()
+                if ok:
+                    st.success(f"Fetched {ok} file(s) into data/raw/.")
+                if fail:
+                    st.warning(f"Some sources may be blocked or unavailable on this network (failed={fail}). You can add more via upload.")
+            except Exception:
+                st.warning("Could not fetch starter files (network blocked or sources unavailable).")
+
+# Rebuild index if asked (do not write to session_state inside cached funcs)
+index, meta, stats = None, [], ""
+if do_rebuild:
+    with st.spinner("Building index…"):
+        index, meta, stats = ensure_index(
+            min_year=st.session_state.filter_year_min,
+            contains=st.session_state.filter_contains.strip()
         )
-    with c2:
-        st.markdown("<div class='button-primary'>", unsafe_allow_html=True)
-        if st.button("Rebuild index", use_container_width=True, on_click=rebuild_index_callback):
-            pass
-        st.markdown("</div>", unsafe_allow_html=True)
-    with c3:
-        st.markdown("<div class='button-primary'>", unsafe_allow_html=True)
-        if st.button("Fetch starter corpus (Anika + federal AI)", use_container_width=True, on_click=fetch_starter_callback):
-            pass
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.session_state.index_ready = index is not None
+    st.session_state.index_stats = stats
 
-    if uploads:
-        with st.spinner("Saving uploads…"):
-            added = save_uploaded_files(uploads)
-            if added > 0:
-                supdate({"status": f"Saved {added} file(s) to data/raw/. Click Rebuild index.", "doc_count": sget("doc_count", 0) + added})
-            else:
-                supdate({"status": "No valid files uploaded (only PDF/HTML supported)."})
-    st.info(sget("status", ""), icon="ℹ️")
+# If we have a persisted index and no rebuild request, try to load and report
+if not do_rebuild and not st.session_state.index_ready:
+    idx_loaded, meta_loaded = load_persisted_index()
+    if idx_loaded is not None and meta_loaded:
+        index, meta = idx_loaded, meta_loaded
+        st.session_state.index_ready = True
+        st.session_state.index_stats = f"Index loaded from disk: {len(meta)} chunks from {len(set(m['file'] for m in meta))} files."
 
-    # Chat section
-    st.divider()
-    st.subheader("Ask about these documents…")
+# Status banner
+if st.session_state.index_stats:
+    st.info(st.session_state.index_stats, icon="🔎")
+else:
+    st.warning("No index yet. Add at least one PDF or HTML to data/raw/ and click Rebuild index.", icon="ℹ️")
 
-    st.markdown("</div>", unsafe_allow_html=True)  # end section-card
+########################################################################################
+# Ask section
+########################################################################################
+st.markdown("### Ask about these documents…")
 
-    q = st.text_input(" ", placeholder="e.g., Summarize Anika Systems capabilities in one sentence")
-    ask = st.button("Ask", type="primary")
-    if ask:
-        st.session_state.query = q.strip()
+q = st.text_input("Ask about the documents", placeholder="e.g., Who is Anika Systems? What capabilities do they offer for federal agencies?")
+ask = st.button("Ask", type="primary")
 
-    if st.session_state.query:
-        if not sget("index_ready", False):
-            st.warning("No index yet. Add PDFs/HTML (or fetch corpus) and click **Rebuild index**.", icon="⚠️")
+if ask:
+    if not st.session_state.index_ready:
+        st.warning("Chat is disabled until an index exists. Add/fetch documents and click Rebuild index.", icon="💡")
+    else:
+        index_active, meta_active = None, None
+
+        # Prefer the live in-memory index if we just rebuilt; otherwise, load persisted.
+        idx_loaded, meta_loaded = load_persisted_index()
+        if idx_loaded is not None and meta_loaded:
+            index_active, meta_active = idx_loaded, meta_loaded
         else:
-            st.markdown(f"<div class='chat-bubble-q'>🗣️ {st.session_state.query}</div>", unsafe_allow_html=True)
-            hits = search(
-                st.session_state.query,
-                top_k=int(st.session_state.top_k),
-                score_thresh=float(st.session_state.score_thresh),
-                section_filter=st.session_state.section_filter,
-                min_year=int(st.session_state.min_year),
+            # last build was not persisted; build minimal ephemeral index from current filters
+            index_active, meta_active, _ = ensure_index(
+                min_year=st.session_state.filter_year_min,
+                contains=st.session_state.filter_contains.strip()
             )
-            ans = answer_from_chunks(st.session_state.query, hits)
-            st.markdown(f"<div class='chat-bubble-a'>{ans}</div>", unsafe_allow_html=True)
 
+        if index_active is None or not meta_active:
+            st.warning("No searchable index available yet. Rebuild the index first.", icon="ℹ️")
+        else:
+            # we also need the chunk texts to construct the answer (read from disk)
+            # If CHUNK_JSON present, we pull only meta; we will reconstruct chunk list by re-parsing the referenced files.
+            files_map: Dict[str, List[str]] = {}
+            for m in meta_active:
+                files_map.setdefault(m["file"], []).append(m["chunk_id"])
+
+            # Recreate chunk list deterministically by reading each file and chunking in the same way
+            chunks: List[str] = []
+            file_to_start: Dict[str, int] = {}
+            i_start = 0
+            seen = set()
+            for m in meta_active:
+                fname = m["file"]
+                if fname in seen: 
+                    continue
+                seen.add(fname)
+                path = pathlib.Path(m["path"])
+                txt = load_file_text(path)
+                cs = chunk_text(txt, max_tokens=220, overlap=50)
+                file_to_start[fname] = i_start
+                chunks.extend(cs)
+                i_start += len(cs)
+
+            hits = search(index_active, meta_active, q, k=max(1, int(st.session_state.top_k)))
+            answer, cits = generate_answer(q, hits, chunks, float(st.session_state.threshold))
+
+            with st.container():
+                st.markdown("<div class='card'>", unsafe_allow_html=True)
+                st.markdown(f"**🔎 {q.strip()}**")
+                st.write(answer)
+
+                if cits:
+                    st.markdown("**Sources:**")
+                    for sc, fn in cits:
+                        st.markdown(f"- `{fn}`  · similarity={sc:.2f}")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+########################################################################################
 # Footer
-st.markdown("<div class='footer'>Powered by Monique Bruce</div>", unsafe_allow_html=True)
+########################################################################################
+st.markdown(f"<div class='footer'>{POWERED_BY}</div>", unsafe_allow_html=True)
