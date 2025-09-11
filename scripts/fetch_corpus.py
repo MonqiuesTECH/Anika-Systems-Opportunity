@@ -46,3 +46,13 @@ def fetch_starter_corpus(raw_root: Path = Path("data/raw")) -> int:
             # Keep going; just skip failed URL
             print(f"[fetch] skip {url}: {e}")
     return saved
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p data/raw
+python - <<'PY'
+from src.loaders import fetch_starter_corpus
+from pathlib import Path
+saved, failed = fetch_starter_corpus(Path("data/raw"), target_count=40)
+print(f"Saved={len(saved)} Failed={len(failed)}")
+PY
+echo "Done."
