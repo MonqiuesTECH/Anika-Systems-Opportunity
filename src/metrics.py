@@ -1,20 +1,9 @@
-import math
-import tiktoken
+# src/metrics.py
+from __future__ import annotations
+from typing import List, Dict
 
-def fmt_ms(ms: int) -> str:
-    return f"{ms:,} ms" if ms < 1000 else f"{ms/1000:.2f} s"
-
-class TokenCounter:
-    def __init__(self, model_name: str = "gpt-4o-mini"):
-        # model name only affects encoding choice; safe default
-        try:
-            self.enc = tiktoken.encoding_for_model(model_name)
-        except Exception:
-            self.enc = tiktoken.get_encoding("cl100k_base")
-
-    def estimate_prompt_tokens(self, text: str) -> int:
-        try:
-            return len(self.enc.encode(text or ""))
-        except Exception:
-            # rough fallback
-            return max(1, math.ceil(len(text or "") / 4))
+def compute_hit_ratio(hits: List[Dict]) -> float:
+    if not hits:
+        return 0.0
+    top = sum(1 for h in hits if h.get("score",0) >= 0.30)
+    return round(top / max(1, len(hits)), 3)
