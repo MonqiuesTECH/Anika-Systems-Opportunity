@@ -1,75 +1,45 @@
-import json
-import pathlib
+# src/clean_chunk.py
+from __future__ import annotations
 import re
-from typing import List, Dict, Iterable
+from typing import List, Dict, Optional, Tuple
 
-PROC_FILENAME = "chunks.jsonl"
+def _clean(text: str) -> str:
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[\u200b\u200c\u200d]+", "", text)  # zero-widths
+    return text.strip()
 
-def _normalize_whitespace(t: str) -> str:
-    t = re.sub(r"[ \t]+", " ", t or "")
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()
+def _year_guard(meta_src: str, text: str, min_year: Optional[int]) -> bool:
+    if not min_year or min_year <= 0:
+        return True
+    # simple year scan; keep if any year ≥ min_year exists
+    years = [int(y) for y in re.findall(r"\b(19|20)\d{2}\b", text)]
+    return any(y >= min_year for y in years)
 
-def _split_by_heading_or_sentences(text: str, max_chars: int = 1200) -> Iterable[str]:
-    if not text:
-        return []
-    # Prefer block/heading splits; fall back to paragraph gaps.
-    blocks = re.split(r"\n\s*(?P<h>#+\s+|[A-Z][A-Za-z0-9 ]{2,}\n[-=]{3,}\n)", text)
-    if len(blocks) == 1:
-        blocks = re.split(r"\n{2,}", text)
-
-    out: List[str] = []
-    for block in blocks:
-        b = _normalize_whitespace(block)
-        if not b:
+def clean_and_chunk(
+    docs: List[Dict], 
+    section_substr: Optional[str] = None,
+    min_year: Optional[int] = None,
+    chunk_size: int = 850,
+    overlap: int = 120
+) -> Tuple[List[str], List[Dict]]:
+    chunks, meta = [], []
+    section_substr = (section_substr or "").lower().strip()
+    for d in docs:
+        txt = _clean(d["text"])
+        if section_substr and section_substr not in txt.lower():
             continue
-        while len(b) > max_chars:
-            cut = b.rfind(". ", 0, max_chars)
-            if cut == -1:
-                cut = max_chars
-            out.append(b[:cut].strip())
-            b = b[cut:].strip()
-        if b:
-            out.append(b)
-    return out
-
-def _infer_year(text: str) -> int:
-    candidates = re.findall(r"\b(20\d{2}|19\d{2})\b", text or "")
-    if not candidates:
-        return 0
-    try:
-        years = [int(c) for c in candidates]
-        return max(years)
-    except Exception:
-        return 0
-
-def clean_and_chunk(docs: List[Dict], save_dir: pathlib.Path) -> List[Dict]:
-    save_dir.mkdir(parents=True, exist_ok=True)
-    chunks_path = save_dir / PROC_FILENAME
-
-    chunks: List[Dict] = []
-    for d in docs or []:
-        text = _normalize_whitespace(d.get("text", ""))
-        if not text:
+        if not _year_guard(d["source"], txt, min_year):
             continue
+        # simple sliding window
+        words = txt.split()
+        if len(words) <= chunk_size:
+            chunks.append(" ".join(words)); meta.append({"source": d["source"]}); continue
+        step = max(1, chunk_size - overlap)
+        for i in range(0, len(words), step):
+            chunk = " ".join(words[i:i+chunk_size])
+            if len(chunk) < 200:
+                continue
+            chunks.append(chunk)
+            meta.append({"source": d["source"]})
+    return chunks, meta
 
-        # Precompute year once per doc
-        year = _infer_year(text)
-
-        for i, chunk in enumerate(_split_by_heading_or_sentences(text)):
-            chunks.append({
-                "doc_id": d.get("id", ""),
-                "title": d.get("title", ""),
-                "source": d.get("source", ""),
-                "url": d.get("url", ""),
-                "section": "",
-                "year": year,
-                "text": chunk
-            })
-
-    # Persist even if empty so downstream logic can handle gracefully
-    with open(chunks_path, "w", encoding="utf-8") as f:
-        for c in chunks:
-            f.write(json.dumps(c, ensure_ascii=False) + "\n")
-
-    return chunks
