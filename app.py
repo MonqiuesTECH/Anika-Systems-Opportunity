@@ -1,6 +1,6 @@
 # app.py — Anika Systems RAG (local FAISS + MiniLM)
 # Black/blue branding • Auto-ingest PDFs/HTML • Fetch-50 fallback • Progress bar
-# Concise grounded answers • Metrics row • 100-char previews
+# Concise grounded answers • Metrics row • 100-char previews • Expander toggle
 # Python 3.13 / Streamlit 1.49+
 
 from __future__ import annotations
@@ -263,9 +263,19 @@ def fetch_50_docs(raw_dir: Path) -> Tuple[int, int, int]:
 st.markdown(f"# {APP_TITLE}")
 st.caption("RAG Chatbot — Source-Grounded Answers (local FAISS + MiniLM)")
 
-# Sidebar controls
-k = st.sidebar.slider("Top-K Documents", 1, 10, 4)
-threshold = st.sidebar.slider("Score Threshold", 0.0, 1.0, 0.40, 0.01)
+# Sidebar controls + UX toggle for expander default
+if "show_sources_default" not in st.session_state:
+    st.session_state["show_sources_default"] = False  # closed by default for a tidy UI
+
+with st.sidebar:
+    k = st.slider("Top-K Documents", 1, 10, 4)
+    threshold = st.slider("Score Threshold", 0.0, 1.0, 0.40, 0.01)
+    st.divider()
+    st.session_state["show_sources_default"] = st.toggle(
+        "Show sources by default",
+        value=st.session_state["show_sources_default"],
+        help="Keeps the Sources & Previews section expanded after each answer."
+    )
 
 # Controls row
 c1, c2 = st.columns([1,1])
@@ -308,7 +318,10 @@ if st.button("Ask"):
         m3.metric("# indexed chunks", f"{chunks_total}")
 
         # --- Sources + Previews (first 100 chars) ---
-        with st.expander("Sources & 100-char previews", expanded=True):
+        with st.expander(
+            "Sources & 100-char previews",
+            expanded=bool(st.session_state.get("show_sources_default", False))
+        ):
             for h in hits:
                 meta = h["meta"]
                 snippet = h.get("text") or load_snippet_from_disk(meta)
