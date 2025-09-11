@@ -1,59 +1,66 @@
-import pathlib
+# src/loaders.py
+from __future__ import annotations
+from pathlib import Path
 from typing import List, Dict
-from bs4 import BeautifulSoup
 from pypdf import PdfReader
+from bs4 import BeautifulSoup
 
-ALLOWED_EXT = {".pdf", ".html", ".htm"}
+RAW_DIR = Path("data/raw")
+SEED_DIR = Path("data/seed")
 
-def _read_pdf(path: pathlib.Path) -> str:
-    text_parts = []
-    try:
-        pdf = PdfReader(str(path))
+def _read_pdf(path: Path) -> str:
+    text = []
+    with open(path, "rb") as f:
+        pdf = PdfReader(f)
         for page in pdf.pages:
-            t = page.extract_text() or ""
-            text_parts.append(t)
-    except Exception as e:
-        # If extraction fails, still return empty string so guards trigger gracefully
-        print(f"[loader] PDF read failed {path}: {e}")
-    return "\n".join(text_parts).strip()
+            txt = page.extract_text() or ""
+            if txt:
+                text.append(txt)
+    return "\n".join(text).strip()
 
-def _read_html(path: pathlib.Path) -> str:
-    try:
-        html = path.read_text(encoding="utf-8", errors="ignore")
-        soup = BeautifulSoup(html, "lxml")
-        for s in soup(["script", "style"]):
-            s.extract()
-        return soup.get_text(separator="\n").strip()
-    except Exception as e:
-        print(f"[loader] HTML read failed {path}: {e}")
-        return ""
+def _read_html(path: Path) -> str:
+    html = path.read_text(encoding="utf-8", errors="ignore")
+    soup = BeautifulSoup(html, "lxml")
+    # Keep visible text only
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    return " ".join(soup.get_text(separator=" ").split())
 
-def load_raw_documents(raw_dir: pathlib.Path) -> List[Dict]:
-    raw_dir.mkdir(parents=True, exist_ok=True)
+def _enumerate_files() -> List[Path]:
+    paths: List[Path] = []
+    for root in (RAW_DIR, SEED_DIR):
+        if root.exists():
+            paths += list(root.rglob("*.pdf"))
+            paths += list(root.rglob("*.html"))
+            paths += list(root.rglob("*.htm"))
+    # De-dup by name in case seed == raw
+    uniq: Dict[str, Path] = {}
+    for p in paths:
+        uniq[str(p.resolve())] = p
+    return list(uniq.values())
+
+def load_raw_documents(raw_dir: Path | None = None) -> List[Dict]:
     docs: List[Dict] = []
-
-    paths = [p for p in sorted(raw_dir.glob("**/*")) if p.is_file() and p.suffix.lower() in ALLOWED_EXT]
-    if not paths:
-        print("[loader] No .pdf/.html files found in data/raw/")
+    files = _enumerate_files()
+    if not files:
+        print("[loader] No .pdf/.html files found in data/raw/ or data/seed/")
         return docs
 
-    for p in paths:
-        text = ""
-        if p.suffix.lower() == ".pdf":
-            text = _read_pdf(p)
-        else:
-            text = _read_html(p)
-
-        if not text:
-            print(f"[loader] Skipped empty text: {p}")
-            continue
-
-        docs.append({
-            "id": str(p.relative_to(raw_dir)),
-            "title": p.stem.replace("_", " ").strip(),
-            "source": str(p),
-            "url": "",
-            "text": text
-        })
+    for p in files:
+        try:
+            if p.suffix.lower() == ".pdf":
+                text = _read_pdf(p)
+            else:
+                text = _read_html(p)
+            if not text:
+                continue
+            docs.append({
+                "id": str(p),
+                "title": p.stem.replace("-", " ").replace("_", " ").title(),
+                "source": str(p.parent.name),
+                "url": "",
+                "text": text,
+            })
+        except Exception as e:
+            print(f"[loader] skip {p}: {e}")
     return docs
-
